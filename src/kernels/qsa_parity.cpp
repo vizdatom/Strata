@@ -571,7 +571,7 @@ int main(int argc, char** argv) {
     // `cudaMemcpy` per cell here; the layer keeps this buffer and updates it per token.
     Dev<int32_t> dpos(1);
     {
-        strata::kernels::QsaIndexerBuffers bufs{dtail.p, ddead.p, dpooled.p, dblockpos.p};
+        strata::kernels::QsaIndexerBuffers bufs{dtail.p, ddead.p, dpooled.p, nullptr, nullptr, dblockpos.p};
         Dev<float> draw((size_t) IDXD);
         for (int64_t t = 0; t < NT; ++t) {      // one cell at a time: the tail is a ring and the spare row MOVES
             check(cudaMemcpy(draw.p, &raw_flat[(size_t) t * IDXD], (size_t) IDXD * 4, cudaMemcpyHostToDevice),
@@ -773,7 +773,7 @@ int main(int argc, char** argv) {
         cudaGraphExec_t exec;
         check(cudaStreamCreate(&stream), "tail stream");
         check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "tail capture begin");
-        strata::kernels::qsa_index_step(pooled.p, query.p, nullptr, S, step.p, max_blocks, scores.p, stream);
+        strata::kernels::qsa_index_step(pooled.p, nullptr, nullptr, query.p, nullptr, S, step.p, max_blocks, scores.p, stream);
         strata::kernels::topk_512_step(scores.p, S, cap, step.p, ids.p, stream);
         check(cudaStreamEndCapture(stream, &graph), "tail capture end");
         check(cudaGraphInstantiate(&exec, graph, 0), "tail instantiate");
@@ -1027,7 +1027,7 @@ int main(int argc, char** argv) {
         Dev<int32_t> dblockpos2(1);
         Dev<int32_t> dpos2(1);
         Dev<float> draw((size_t) IDXD);
-        strata::kernels::QsaIndexerBuffers bufs{dptail.p, dpdead.p, dpp.p, dblockpos2.p};
+        strata::kernels::QsaIndexerBuffers bufs{dptail.p, dpdead.p, dpp.p, nullptr, nullptr, dblockpos2.p};
         for (int64_t t = 0; t < T; ++t) {
             check(cudaMemcpy(draw.p, &praw[(size_t) t * IDXD], (size_t) IDXD * 4, cudaMemcpyHostToDevice), "raw");
             const int32_t tpos = (int32_t) t;
@@ -1310,7 +1310,7 @@ int main(int argc, char** argv) {
         Dev<float> pooled2((size_t) (nb2 + 2) * IDXD2), dead2(IDXD2), tail2((size_t) (R2 - 1) * IDXD2);
         Dev<int32_t> bpos2(1), pos2(1);
         Dev<float> raw2d(IDXD2);
-        strata::kernels::QsaIndexerBuffers bufs2{tail2.p, dead2.p, pooled2.p, bpos2.p};
+        strata::kernels::QsaIndexerBuffers bufs2{tail2.p, dead2.p, pooled2.p, nullptr, nullptr, bpos2.p};
 
         // capture ONE call, on its own stream
         cudaStream_t cs = nullptr;
@@ -1419,8 +1419,8 @@ int main(int argc, char** argv) {
             check(cudaMemset(bposA.p, 0, 4), "zero"); check(cudaMemset(bposB.p, 0, 4), "zero");
             Dev<float> draw((size_t) IDXD), drawAll;
             drawAll.put(raws);
-            strata::kernels::QsaIndexerBuffers bufsA{tailA.p, deadA.p, pooledA.p, bposA.p};
-            strata::kernels::QsaIndexerBuffers bufsB{tailB.p, deadB.p, pooledB.p, bposB.p};
+            strata::kernels::QsaIndexerBuffers bufsA{tailA.p, deadA.p, pooledA.p, nullptr, nullptr, bposA.p};
+            strata::kernels::QsaIndexerBuffers bufsB{tailB.p, deadB.p, pooledB.p, nullptr, nullptr, bposB.p};
             for (int64_t t = 0; t < NB; ++t) {         // the sequential side: one cell, its device position
                 check(cudaMemcpy(draw.p, &raws[(size_t) t * IDXD], (size_t) IDXD * 4, cudaMemcpyHostToDevice), "raw");
                 const int32_t tp = (int32_t) t;
@@ -1490,7 +1490,7 @@ int main(int argc, char** argv) {
             check(cudaMemset(dd.p, 0, (size_t) IDXD * 4), "zero");
             check(cudaMemset(tail.p, 0, trows * 4), "zero");
             check(cudaMemset(bpos.p, 0, 4), "zero");
-            strata::kernels::QsaIndexerBuffers bufs{tail.p, dd.p, pooled.p, bpos.p};
+            strata::kernels::QsaIndexerBuffers bufs{tail.p, dd.p, pooled.p, nullptr, nullptr, bpos.p};
             if (native) {
                 strata::kernels::native_qsa_indexer_append(draw0.p, dpos0.p, 0, dw_kn.p, EPS, bufs, S, MC, sc, cs);
             } else {

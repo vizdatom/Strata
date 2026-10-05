@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdint>
 #include <limits>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -61,7 +64,7 @@ bool checkpoint_targets(const SessionState& ss, const ModelGeometry& g, size_t t
         const auto& st = owned(ss, j);
         const auto block = strata::kernels::qsa_real_shapes().idx_block;
         size_t pooled_bytes = 0;
-        if (!st.idx_tail || !st.idx_dead || !st.idx_block_pos || !st.idx_pooled ||
+        if (!st.idx_tail || !st.idx_dead || !st.idx_block_pos || (!st.idx_pooled && !st.idx_pooled_i8) ||
             st.max_cells < 0 || tokens > (uint64_t) st.max_cells ||
             (tokens && tokens / (uint64_t) block >= (uint64_t) std::max<int64_t>(0, st.idx_pooled_rows)) ||
             !product(pooled_bytes, {tokens / (uint64_t) block + 1, (uint64_t) g.idx_key_dim, sizeof(float)}))
@@ -183,7 +186,20 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
             !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (st.idx_int8) {
+                // The checkpoint holds the dead key as FP32; re-quantize it into the state's INT8 store.
+                std::vector<float> tmp((size_t) g.idx_key_dim);
+                if (!copy(tmp.data(), c.dead.data() + j * z.dead, z.dead, error)) return false;
+                float maxabs = 0.0f;
+                for (int64_t d = 0; d < g.idx_key_dim; ++d) maxabs = std::fmax(maxabs, std::fabs(tmp[d]));
+                const float scale = maxabs > 0.0f ? maxabs / 127.0f : 1.0f;
+                std::vector<int8_t> codes((size_t) g.idx_key_dim);
+                for (int64_t d = 0; d < g.idx_key_dim; ++d) codes[d] = (int8_t) lrintf(tmp[d] / scale);
+                if (!copy(st.idx_pooled_i8 + row * g.idx_key_dim, codes.data(), (size_t) g.idx_key_dim, error) ||
+                    !copy(st.idx_pooled_scale + row, &scale, 4, error))
+                    return false;
+            } else if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error))
+                return false;
         }
     }
     const size_t tokens = c.ids.size();

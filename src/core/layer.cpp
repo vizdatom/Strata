@@ -480,7 +480,9 @@ bool layer_verify_compatible(std::string& why) {
     else if (!g_fused_gdn || !strata::kernels::native_gdn_enabled()) why = "the fused native GDN kernels are off";
     else if (!g_fast_attn || native_flash_attn_short) why = "the split-K decode attention is off";
     else if (!g_fast_select) why = "the block top-k selection is off";
-    else if (!strata::kernels::native_qsa_indexer_enabled()) why = "the native QSA indexer is off";
+    // The int8 pooled path (STRATA_IDX_INT8) disables the native indexer and decodes through
+    // indexer_key_append; the verify window reproduces that path, so it is compatible too.
+    else if (!strata::kernels::native_qsa_indexer_enabled() && !qsa_idx_int8()) why = "the native QSA indexer is off";
     else return true;
     return false;
 }
@@ -513,6 +515,9 @@ struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>   
 namespace {
 // KV streaming (docs/kv-streaming-design.md): 0 keeps every cell in VRAM.
 int64_t g_kv_resident = 0;
+// STRATA_IDX_INT8: the QSA indexer pooled keys are INT8 (per-row scale) instead of FP32 (opt-in; the
+// FP32 default is bit-exact).
+bool g_idx_int8 = false;
 uint64_t g_kv_host_bytes = 0;
 
 /// How one state holds its K/V: `mode` as in QsaState::kv_mode, `slots` VRAM pages of `pages` logical ones.
@@ -552,6 +557,11 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
 }  // namespace
 
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
+void qsa_set_idx_int8(bool on) { g_idx_int8 = on; }
+bool qsa_idx_int8() { return g_idx_int8; }
+bool g_rope_onfly = false;
+void qsa_set_rope_onfly(bool on) { g_rope_onfly = on; }
+bool qsa_rope_onfly() { return g_rope_onfly; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
@@ -566,9 +576,11 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
-    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
+    n += g_idx_int8 ? (uint64_t) p.pooled_rows * s.idx_dim + (uint64_t) p.pooled_rows * 4
+                    : (uint64_t) p.pooled_rows * s.idx_dim * 4;                 // pooled (INT8 + per-row scale)
     n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
+    if (with_rope && !g_rope_onfly)
+        n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables (skipped on-the-fly)
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     return align_up16(n) + 256;
@@ -632,15 +644,21 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
     st.idx_pooled_rows = p.pooled_rows;
-    st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    if (g_idx_int8) {
+        st.idx_pooled_i8 = c.take<int8_t>((uint64_t) p.pooled_rows * s.idx_dim);
+        st.idx_pooled_scale = c.take<float>((uint64_t) p.pooled_rows);
+        st.idx_int8 = true;
+    } else {
+        st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    }
     st.idx_block_pos = c.take<int32_t>(1);
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
-    } else {
+    } else if (!g_rope_onfly) {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
-    }
+    }   // on-the-fly: cos_tab/sin_tab stay nullptr, the rotation kernels compute the angles
     st.step = c.take<int32_t>((uint64_t) strata::kernels::kStepCount);
     st.attention_status = c.take<int32_t>(1);
     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
@@ -687,7 +705,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // frequencies in float64 and reproducing that on device means double-precision `pow`/`cos` that need not
     // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
     // The process's rope scaling (none by default) is INSIDE the table - the rotation kernels cannot tell.
-    if (share_rope == nullptr) {
+    if (share_rope == nullptr && !g_rope_onfly) {
         std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
         strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,
                                           hc.data(), hs.data());
@@ -696,7 +714,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp, STRATA_ROPE_TABLE=1)
             strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
-    }
+    }   // on-the-fly: no table, no global table (the native/prompt kernels fall back to their analytic path)
     // the page table starts as the IDENTITY, which is the simplest legal mapping and what a caller that does
     // not page at all wants; a streamed state starts with nothing resident, a ring at `block % n_slots`.
     if (p.mode == 0) {
@@ -738,7 +756,12 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
-    cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    if (st.idx_int8) {
+        cudaMemsetAsync(st.idx_pooled_i8, 0, (size_t) st.idx_pooled_rows * s.idx_dim, cs);
+        cudaMemsetAsync(st.idx_pooled_scale, 0, (size_t) st.idx_pooled_rows * 4, cs);
+    } else {
+        cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    }
 }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
@@ -940,7 +963,7 @@ if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV
 }
 if (st.kv_q4) {
     strata::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
-} else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
+} else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_pooled_i8, st.idx_pooled_scale, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
     try {
         native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
             (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, rope_scaling(), stream);
@@ -967,10 +990,10 @@ if (!normalize_rotate(b.q_idx, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim))
 int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     if (g_fast_select) {
         // Plan v0.3 P7: block-level FP32 scores and a radix selection over blocks (qsa_select.hpp).
-        qsa_block_scores(st.idx_pooled, st.idx_dead, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);
+        qsa_block_scores(st.idx_pooled, st.idx_pooled_i8, st.idx_pooled_scale, st.idx_dead, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);
         qsa_block_topk(b.cell_scores, st.step, 1, max_blocks, cap, s, b.ids, stream);
     } else {
-    qsa_index_step(st.idx_pooled, b.q_idx, nullptr, s, st.step, max_blocks, b.cell_scores, stream);    topk_512_step(b.cell_scores, s, cap, st.step, b.ids, stream);
+    qsa_index_step(st.idx_pooled, st.idx_pooled_i8, st.idx_pooled_scale, b.q_idx, nullptr, s, st.step, max_blocks, b.cell_scores, stream);    topk_512_step(b.cell_scores, s, cap, st.step, b.ids, stream);
     }
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);

@@ -1772,6 +1772,18 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
+    const char* idx_int8_env = std::getenv("STRATA_IDX_INT8");
+    if (idx_int8_env != nullptr && idx_int8_env[0] == '1') {
+        strata::core::qsa_set_idx_int8(true);
+        std::fprintf(stderr, "strata generate: STRATA_IDX_INT8=1: the QSA indexer pooled keys are INT8 (opt-in); "
+                    "the native indexer (FP32 pooled only) is disabled\n");
+    }
+    const char* rope_onfly_env = std::getenv("STRATA_ROPE_ONFLY");
+    if (rope_onfly_env != nullptr && rope_onfly_env[0] == '1') {
+        strata::core::qsa_set_rope_onfly(true);
+        std::fprintf(stderr, "strata generate: STRATA_ROPE_ONFLY=1: the RoPE cos/sin are computed on the fly "
+                    "(no precomputed table)\n");
+    }
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
@@ -2292,7 +2304,7 @@ int main(int argc, char** argv) {
     strata::kernels::native_gdn_set_enabled(o.native_gdn);
     strata::kernels::native_router_set_enabled(o.native_router);
     strata::kernels::native_qsa_set_enabled(o.native_qsa);
-    strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
+    strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer && !strata::core::qsa_idx_int8());
     strata::kernels::native_rope_set_enabled(o.native_rope);
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
@@ -5077,7 +5089,11 @@ int main(int argc, char** argv) {
             // First by arithmetic: a prompt path without a loan allocates its buffers, so the chunk must leave
             // headroom on that device (a chunk that fits to the last MiB left hipBLAS nothing: its GEMMs then
             // failed to launch on gfx1201 and the prompt hung).  `bytes_needed` is the same count `init` makes.
-            const int64_t kHeadroom = 512ll << 20;
+            int64_t kHeadroom = 512ll << 20;
+            if (const char* v = std::getenv("STRATA_PROMPT_HEADROOM_MIB"); v != nullptr) {
+                const long mib = std::atol(v);
+                if (mib >= 0) kHeadroom = (int64_t) mib << 20;
+            }
             auto own_fits = [&](int64_t c, int& dev_out, int64_t& need_out, int64_t& free_out) -> bool {
                 for (size_t i = 0; i <= stages.size(); ++i) {
                     const bool loan = i == 0 ? borrow != nullptr : (i < pf_parts.size() && pf_parts[i].first >= 0);
@@ -7496,9 +7512,18 @@ int main(int argc, char** argv) {
                     const strata::core::QsaState& st = ss.qsa_states[ss.qsa_ord0 + j];
                     h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
                     h_dead = hash_dev(st.idx_dead, z.dead, h_dead);
-                    h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
-                    h_pool_full = hash_dev(st.idx_pooled, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * qs.idx_dim * 4,
-                                           h_pool_full);
+                    if (st.idx_int8) {
+                        h_pool = hash_dev(st.idx_pooled_i8, (size_t) (L / qs.idx_block) * qs.idx_dim, h_pool);
+                        h_pool = hash_dev(st.idx_pooled_scale, (size_t) (L / qs.idx_block) * 4, h_pool);
+                        h_pool_full = hash_dev(st.idx_pooled_i8, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * qs.idx_dim,
+                                               h_pool_full);
+                        h_pool_full = hash_dev(st.idx_pooled_scale, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * 4,
+                                               h_pool_full);
+                    } else {
+                        h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
+                        h_pool_full = hash_dev(st.idx_pooled, (size_t) (L > 0 ? L / qs.idx_block + 1 : 0) * qs.idx_dim * 4,
+                                               h_pool_full);
+                    }
                     // KV streaming: the host copy is the identity layout and holds every cell
                     for (const auto& [pool, w] : kv_arrays(st)) {
                         h_kv = hash_cells(pool, w, 0, L, h_kv);

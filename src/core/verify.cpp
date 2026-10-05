@@ -815,10 +815,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 for (int t = tb; t < te; ++t) {
                     const QsaState& sx = slot_ss(t).qsa_states[qi];
-                    const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                    native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
-                                              (const float*) wikn->data, EPS, ib, s, sx.max_cells,
-                                              rope_scaling(), cs);
+                    const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_pooled_i8, sx.idx_pooled_scale, sx.idx_block_pos};
+                    if (native_qsa_indexer_enabled())
+                        native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                                                  (const float*) wikn->data, EPS, ib, s, sx.max_cells,
+                                                  rope_scaling(), cs);
+                    else
+                        indexer_key_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                                           (const float*) wikn->data, EPS, ib, s, sx.cos_tab, sx.sin_tab, cs);
                 }
                 stamp(l, 9, grp);
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
@@ -855,7 +859,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
-                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
+                        qsa_block_scores(sx.idx_pooled, sx.idx_pooled_i8, sx.idx_pooled_scale, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
                                          max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
                         qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
                                        sel_ + (size_t) t * cap_, cs);
@@ -866,7 +870,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               attn_ + t * NH * HD, 1, cs);
                     }
                 } else {
-                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
+                qsa_block_scores(st.idx_pooled, st.idx_pooled_i8, st.idx_pooled_scale, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
                                  s, scores_ + (size_t) tb * max_blocks_, cs);
                 qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                sel_ + (size_t) tb * cap_, cs);
@@ -1300,11 +1304,16 @@ bool Verifier::capture_commit(std::string& err) {
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wikn) { ok = false; break; }
                 copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
-                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                for (int64_t t = 0; t < MT; ++t)
-                    native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
-                                              (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                              rope_scaling(), cs_);
+                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_pooled_i8, st.idx_pooled_scale, st.idx_block_pos};
+                for (int64_t t = 0; t < MT; ++t) {
+                    if (native_qsa_indexer_enabled())
+                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                                                  (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                  rope_scaling(), cs_);
+                    else
+                        indexer_key_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                                           (const float*) wikn->data, EPS, ib, s, st.cos_tab, st.sin_tab, cs_);
+                }
                 ++qsa_index;
             }
         }
@@ -1855,9 +1864,13 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                 for (int t = 0; t < S; ++t) {
                     const QsaState& st = slots_[(size_t) rows[t]]->qsa_states[qsa_index];
                     copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[t] * nQ + qsa_index) * TS, TS, cs_);
-                    const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                    native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commitb_ + (size_t) rows[t] * CB + 2,
-                                              0, (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
+                    const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_pooled_i8, st.idx_pooled_scale, st.idx_block_pos};
+                    if (native_qsa_indexer_enabled())
+                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commitb_ + (size_t) rows[t] * CB + 2,
+                                                  0, (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
+                    else
+                        indexer_key_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commitb_ + (size_t) rows[t] * CB + 2,
+                                           0, (const float*) wikn->data, EPS, ib, s, st.cos_tab, st.sin_tab, cs_);
                 }
                 ++qsa_index;
             }

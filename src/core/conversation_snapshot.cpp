@@ -1,5 +1,6 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/qsa.hpp"
 #include "conversation_checked.hpp"
 #include <cuda_runtime.h>
 
@@ -159,6 +160,18 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     image.pooled_rows = l.pooled_rows;
     image.idx_dim = g.idx_key_dim;
     const auto src = pools(st);
+    // INT8 pooled: the snapshot format is FP32, so dequantize the rows into a temporary buffer first.
+    float* tmp_pooled = nullptr;
+    auto free_tmp = [&]() { if (tmp_pooled) { cudaFree(tmp_pooled); tmp_pooled = nullptr; } };
+    if (st.idx_int8 && index && image.pooled_rows > 0) {
+        const size_t pooled_bytes = (size_t) image.pooled_rows * (size_t) g.idx_key_dim * 4;
+        if (cudaMalloc((void**) &tmp_pooled, pooled_bytes) != cudaSuccess) {
+            error = "conversation snapshot: no room for the INT8 pooled dequantize buffer";
+            return false;
+        }
+        strata::kernels::pooled_i8_dequant(st.idx_pooled_i8, st.idx_pooled_scale, tmp_pooled, image.pooled_rows,
+                                           g.idx_key_dim, nullptr);
+    }
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     for (size_t i = 0; i < dst.size(); ++i) {
@@ -166,13 +179,15 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         // pages/rows strictly before the first rewritten token remain identical.
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
-        if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
+        if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; free_tmp(); return false; }
         dst[i]->resize(sizes[i]);
+        const void* src_i = (i == 4 && tmp_pooled) ? tmp_pooled : src[i];
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
-            })) return false;
+                return transfer(p, src_i ? static_cast<const uint8_t*>(src_i) + at : nullptr, n, error);
+            })) { free_tmp(); return false; }
         if (reused_bytes) *reused_bytes += keep;
     }
+    free_tmp();
     return true;
 }
 
@@ -192,8 +207,10 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     for (size_t i = 0; i < src.size(); ++i)
         if (src[i]->size() != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
     const auto dst = pools(st);
-    for (size_t i = 0; i < src.size(); ++i)
-        if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    for (size_t i = 0; i < src.size(); ++i) {
+        const void* dst_i = (i == 4 && st.idx_int8) ? st.idx_pooled_i8 : dst[i];
+        if (sizes[i] && !dst_i) { error = "conversation snapshot: missing target state buffer"; return false; }
+    }
     return true;
 }
 
@@ -202,10 +219,27 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
-    for (size_t i = 0; i < src.size(); ++i)
+    // INT8 pooled: the snapshot is FP32, so stage the rows in a temporary buffer and re-quantize them.
+    float* tmp_pooled = nullptr;
+    auto free_tmp = [&]() { if (tmp_pooled) { cudaFree(tmp_pooled); tmp_pooled = nullptr; } };
+    if (st.idx_int8 && index && image.pooled_rows > 0) {
+        const size_t pooled_bytes = (size_t) image.pooled_rows * (size_t) g.idx_key_dim * 4;
+        if (cudaMalloc((void**) &tmp_pooled, pooled_bytes) != cudaSuccess) {
+            error = "conversation snapshot: no room for the INT8 pooled quantize buffer";
+            return false;
+        }
+    }
+    for (size_t i = 0; i < src.size(); ++i) {
+        void* dst_i = (i == 4 && tmp_pooled) ? tmp_pooled : dst[i];
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
-            })) return false;
+                return transfer(static_cast<uint8_t*>(dst_i) + at, p, n, error);
+            })) { free_tmp(); return false; }
+    }
+    if (tmp_pooled) {
+        strata::kernels::pooled_i8_quant(tmp_pooled, st.idx_pooled_i8, st.idx_pooled_scale, image.pooled_rows,
+                                         g.idx_key_dim, nullptr);
+        free_tmp();
+    }
     // VRAM slots still contain the outgoing conversation. Resolve must refill
     // them from the restored authoritative pools before any attention reads.
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
@@ -242,10 +276,25 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     };
     const std::array<const ConversationBuffer*, 5> saved = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto authoritative = pools(st);
-    for (size_t i = 0; i < saved.size(); ++i)
+    // INT8 pooled: dequantize the state's rows into a temporary buffer for the byte comparison.
+    float* tmp_pooled = nullptr;
+    auto free_tmp = [&]() { if (tmp_pooled) { cudaFree(tmp_pooled); tmp_pooled = nullptr; } };
+    if (st.idx_int8 && index && image.pooled_rows > 0) {
+        const size_t pooled_bytes = (size_t) image.pooled_rows * (size_t) g.idx_key_dim * 4;
+        if (cudaMalloc((void**) &tmp_pooled, pooled_bytes) != cudaSuccess) {
+            error = "conversation snapshot: no room for the INT8 pooled verify buffer";
+            return false;
+        }
+        strata::kernels::pooled_i8_dequant(st.idx_pooled_i8, st.idx_pooled_scale, tmp_pooled, image.pooled_rows,
+                                           g.idx_key_dim, nullptr);
+    }
+    for (size_t i = 0; i < saved.size(); ++i) {
+        const void* auth_i = (i == 4 && tmp_pooled) ? tmp_pooled : authoritative[i];
         if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
-            })) return false;
+                return compare(static_cast<const uint8_t*>(auth_i) + at, p, n, true);
+            })) { free_tmp(); return false; }
+    }
+    free_tmp();
     if (st.kv_mode == 2 && image.cells > 0) {
         const auto resident = pools(st, true);
         const int64_t end = image.cells / image.page_size;

@@ -97,7 +97,8 @@ namespace {
 __global__ void rope_neox_kernel(const float* __restrict__ x, float* __restrict__ out, long long rows,
                                  int head_dim, int n_rot, const float* __restrict__ cos_tab,
                                  const float* __restrict__ sin_tab, const int* __restrict__ pos,
-                                 const int32_t* __restrict__ mtab) {
+                                 const int32_t* __restrict__ mtab,
+                                 float theta_scale, const RopeKernelArgs ka) {
     const long long r = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) return;
     const int half = n_rot / 2;
@@ -106,9 +107,19 @@ __global__ void rope_neox_kernel(const float* __restrict__ x, float* __restrict_
 
     for (int d = n_rot; d < head_dim; ++d) orow[d] = xr[d];      // the PARTIAL rotation's untouched tail
     for (int i = 0; i < half; ++i) {
-        const size_t toff = (size_t) mrope_pos(mtab, pos[r], i) * half;   // the image path's per-pair position
+        const int p = mrope_pos(mtab, pos[r], i);   // the image path's per-pair position
+        float c, s;
+        if (cos_tab != nullptr) {
+            const size_t toff = (size_t) p * half;
+            c = cos_tab[toff + i];
+            s = sin_tab[toff + i];
+        } else {   // on-the-fly: the analytic angle (STRATA_ROPE_ONFLY), the native path's default math
+            const float theta_extrap = (float) p * powf(theta_scale, (float) i);
+            rope_scaled_angle(theta_extrap, ka.freq_scale, ka.corr_low, ka.corr_high, ka.ext_factor,
+                              ka.attn_factor, i, c, s);
+        }
         // THE PAIRING AND THE SIGNS COME FROM `rope_neox_pair`, shared with the indexer's pooling kernel.
-        rope_neox_pair(xr[i], xr[half + i], cos_tab[toff + i], sin_tab[toff + i], orow[i], orow[half + i]);
+        rope_neox_pair(xr[i], xr[half + i], c, s, orow[i], orow[half + i]);
     }
 }
 
@@ -123,8 +134,12 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
     }
     const int threads = 128;
     const unsigned grid = (unsigned) ((rows + threads - 1) / threads);
+    const RopeScaling& sc = rope_scaling();
+    const float theta_scale = powf((float) sc.freq_base, -2.0f / (float) n_rot);
+    const RopeKernelArgs ka = sc.kernel_args(n_rot);
     rope_neox_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(x, out, rows, head_dim, n_rot, cos_tab,
-                                                                 sin_tab, pos, mrope_table());
+                                                                 sin_tab, pos, mrope_table(),
+                                                                 theta_scale, ka);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "rope_neox_apply launch: %s\n", cudaGetErrorString(e));

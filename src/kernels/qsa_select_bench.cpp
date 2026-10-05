@@ -69,11 +69,11 @@ int main(int argc, char** argv) {
     ck(cudaMalloc(&ids_old, (size_t) (nq * cap) * 4), "malloc");
     ck(cudaMalloc(&ids_new, (size_t) (nq * cap) * 4), "malloc");
     const int64_t active = steps[(size_t) ((nq - 1) * k::kStepCount + k::kStepNBid)] + 1;
-    auto run_old = [&] { k::qsa_block_scores(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_old, nullptr, active); };
+    auto run_old = [&] { k::qsa_block_scores(d_pooled, nullptr, nullptr, d_dead, d_q, d_steps, nq, max_blocks, s, sc_old, nullptr, active); };
     // a device without the tensor-core scorer (HIP other than gfx12): time the warp scorer and the top-k only
-    const bool have_tc = k::qsa_block_scores_tc(d_pooled, d_dead, d_q, d_steps, 1, max_blocks, s, sc_new, nullptr, active);
+    const bool have_tc = k::qsa_block_scores_tc(d_pooled, nullptr, nullptr, d_dead, d_q, d_steps, 1, max_blocks, s, sc_new, nullptr, active);
     auto run_new = [&] {
-        if (!k::qsa_block_scores_tc(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_new, nullptr, active)) {
+        if (!k::qsa_block_scores_tc(d_pooled, nullptr, nullptr, d_dead, d_q, d_steps, nq, max_blocks, s, sc_new, nullptr, active)) {
             std::fprintf(stderr, "tc scorer refused\n");
             std::exit(2);
         }

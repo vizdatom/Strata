@@ -215,7 +215,9 @@ void kv_gather(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* pa
 struct QsaIndexerBuffers {
     float* tail = nullptr;
     float* dead = nullptr;
-    float* pooled = nullptr;
+    float* pooled = nullptr;      ///< fp32 path
+    int8_t* pooled_i8 = nullptr;  ///< int8 path (pooled is null when set)
+    float* pooled_scale = nullptr;///< per-row scale of the int8 path
     int32_t* block_pos = nullptr;
 };
 
@@ -340,7 +342,8 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
 // capacity LARGER than this token needs is correct, not merely safe.
 
 /// `max_blocks` must be at least `(max_cells / idx_block) + 2`.
-void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
+void qsa_index_step(const float* pooled, const int8_t* pooled_i8, const float* pooled_scale,
+                    const float* q_idx, const float* bias, const QsaShapes& s,
                     const int32_t* step, int64_t max_blocks, float* cell_scores, void* stream);
 
 /// `cap` must be `qsa_selection_width(kTopkMaxCells, s)` - the largest width the kernel can ever write.
@@ -365,5 +368,13 @@ struct KvHostPools;   // kv_stream.hpp
 void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
                     const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                     const KvHostPools* host = nullptr);
+
+
+/// Dequantize `rows` of INT8 pooled keys (per-row `scale`) into FP32 `out` (the snapshot save path).
+void pooled_i8_dequant(const int8_t* i8, const float* scale, float* out, int64_t rows, int dim, void* stream);
+
+/// The inverse: quantize FP32 `in` into INT8 codes + per-row `scale` (the snapshot restore path).  Exact on a
+/// dequantized row (the scale is maxabs/127, so the round trip reproduces the codes).
+void pooled_i8_quant(const float* in, int8_t* i8, float* scale, int64_t rows, int dim, void* stream);
 
 }  // namespace strata::kernels

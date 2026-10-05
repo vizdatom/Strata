@@ -24,7 +24,8 @@
 namespace strata::kernels {
 
 /// scores [nq, max_blocks]; q_idx [nq, idx_n_head, idx_dim] (normed and rotated); steps [nq, kStepCount].
-void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+void qsa_block_scores(const float* pooled, const int8_t* pooled_i8, const float* pooled_scale, const float* dead,
+                      const float* q_idx, const int32_t* steps, int64_t nq,
                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream,
                       int64_t active_blocks = -1);   ///< perf-review C-1: > 0 launches only this many blocks (the
                                                      ///< batch's largest n_bid + 1; not for a captured graph)
@@ -32,7 +33,8 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 /// The same scores on tensor cores (3xTF32, FP32-level accuracy but another summation order: not bitwise; the tail
 /// block n_bid is the warp kernel's arithmetic). For the prompt path; false (nothing launched) on another geometry.
 /// On AMD it is the gfx12 (RDNA4) WMMA kernel (a three-way bf16 split, six products); false on any other AMD target.
-bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+bool qsa_block_scores_tc(const float* pooled, const int8_t* pooled_i8, const float* pooled_scale, const float* dead,
+                         const float* q_idx, const int32_t* steps, int64_t nq,
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
 
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
