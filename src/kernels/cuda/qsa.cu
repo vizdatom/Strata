@@ -157,10 +157,16 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
                                           float* __restrict__ tail, float* __restrict__ dead,
                                           float* __restrict__ pooled, int32_t* __restrict__ block_pos,
                                           int idx_dim, int r, int n_rot, const float* __restrict__ cos_tab,
-                                          const float* __restrict__ sin_tab, const int32_t* __restrict__ mtab) {
+                                          const float* __restrict__ sin_tab, const int32_t* __restrict__ mtab,
+                                          float theta_scale, const RopeKernelArgs ka) {
     extern __shared__ double s_mean[];   // idx_dim doubles
     const int d = threadIdx.x;
     const int pos = (int) __ldg(pos_dev);
+    // The commit graph launches one of these per window slot; the slots the window did not use carry
+    // pos = -1 (commit fills them so the graph's launch count stays constant).  `pos % r` is -1 for
+    // them, and `(size_t)(-1) * idx_dim` wraps to a write idx_dim floats BEFORE tail - the KV-streaming
+    // control block in streaming mode.  Unused slots do nothing.
+    if (pos < 0) return;
     const int slot = pos % r;
 
     // The RAW tail: a cell that COMPLETES a block is not stored, because the pool below consumes it directly.
@@ -194,7 +200,15 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
         // correction exactly like every other pooled row and like the native kernel's spare (the unrotated
         // dims pass through, as in the rotation of the completed blocks below).  Skipping the rotation here,
         // as this kernel once did, left `dead` and `pooled[0]` the only unscaled keys of a scaled cache.
-        if (d < n_rot) y *= cos_tab[d % (n_rot / 2)];
+        if (d < n_rot) {
+            if (cos_tab != nullptr) y *= cos_tab[d % (n_rot / 2)];
+            else {   // on-the-fly: the spare rotates at position 0, so only the magnitude correction applies
+                float c0, s0;
+                rope_scaled_angle(0.0f, ka.freq_scale, ka.corr_low, ka.corr_high, ka.ext_factor, ka.attn_factor,
+                                  d % (n_rot / 2), c0, s0);
+                y *= c0;
+            }
+        }
         dead[d] = y;
         pooled[d] = y;
     }
@@ -235,11 +249,135 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
     const int half = n_rot / 2;
     if (d < half) {
         float* row = pooled + (size_t) b * idx_dim;
-        const size_t toff = (size_t) mrope_pos(mtab, pos_base + b * r, d) * half;
+        const int p = mrope_pos(mtab, pos_base + b * r, d);
+        float c, s;
+        if (cos_tab != nullptr) {
+            const size_t toff = (size_t) p * half;
+            c = cos_tab[toff + d];
+            s = sin_tab[toff + d];
+        } else {   // on-the-fly: the analytic angle (STRATA_ROPE_ONFLY), the native path's default math
+            const float theta_extrap = (float) p * powf(theta_scale, (float) d);
+            rope_scaled_angle(theta_extrap, ka.freq_scale, ka.corr_low, ka.corr_high, ka.ext_factor,
+                              ka.attn_factor, d, c, s);
+        }
         // THE SAME `rope_neox_pair` THE STANDALONE ROPE KERNEL USES.  A second transcription of the pairing is
         // what this project keeps finding written down wrong.
-        rope_neox_pair(row[d], row[half + d], cos_tab[toff + d], sin_tab[toff + d], row[d], row[half + d]);
+        rope_neox_pair(row[d], row[half + d], c, s, row[d], row[half + d]);
     }
+}
+
+// ================= 2b. indexer_key_append (int8 pooled) =================
+// The int8 twin of indexer_key_append_kernel: the pooled keys are stored as int8 with a per-row scale
+// (STRATA_IDX_INT8), cutting the full-context pool 4x.  The row is kept in shared memory (s_mean) through
+// the rotation, then quantized; the fp32 kernel is untouched and stays the default.
+__global__ void indexer_key_append_i8_kernel(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+                                             int pos_base, const float* __restrict__ w_k_norm, float eps,
+                                             float* __restrict__ tail, float* __restrict__ dead,
+                                             int8_t* __restrict__ pooled_i8, float* __restrict__ pooled_scale,
+                                             int32_t* __restrict__ block_pos,
+                                             int idx_dim, int r, int n_rot, const float* __restrict__ cos_tab,
+                                             const float* __restrict__ sin_tab, const int32_t* __restrict__ mtab,
+                                             float theta_scale, const RopeKernelArgs ka) {
+    extern __shared__ double s_mean[];   // idx_dim doubles: the row, pre- and post-rotation
+    __shared__ float s_warpmax[32];
+    const int d = threadIdx.x;
+    const int pos = (int) __ldg(pos_dev);
+    // Unused window slot (pos = -1, see indexer_key_append_kernel): do nothing.  Without this the
+    // `(size_t)(-1) * idx_dim` wrap writes idx_dim floats before tail - the KV-streaming control block.
+    if (pos < 0) return;
+    const int slot = pos % r;
+    const int half = n_rot / 2;
+
+    // Block-wide maxabs of s_mean (each thread holds s_mean[d]); all threads must call it together.
+    auto block_maxabs = [&]() -> float {
+        float m = fabsf((float) s_mean[d]);
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        if (lane == 0) s_warpmax[wid] = m;
+        __syncthreads();
+        if (wid == 0) {
+            const int nw = (idx_dim + 31) >> 5;
+            m = (lane < nw) ? s_warpmax[lane] : 0.0f;
+            for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            if (lane == 0) s_warpmax[0] = m;
+        }
+        __syncthreads();
+        return s_warpmax[0];
+    };
+    // Quantize s_mean (the rotated row) into pooled_i8[row] with scale pooled_scale[row].
+    auto quantize = [&](int64_t row) {
+        const float maxabs = block_maxabs();
+        const float scale = maxabs > 0.0f ? maxabs / 127.0f : 1.0f;
+        pooled_i8[(size_t) row * idx_dim + d] = (int8_t) __float2int_rn((float) s_mean[d] / scale);
+        if (d == 0) pooled_scale[row] = scale;
+    };
+
+    if (slot < r - 1) tail[(size_t) slot * idx_dim + d] = raw[d];
+
+    if (pos == 0) {
+        double p = (double) raw[d];
+        double ss = 0.0;
+        for (int i = 0; i < idx_dim; ++i) {
+            const double v = (double) raw[i];
+            ss = __dadd_rn(ss, __dmul_rn(v, v));
+        }
+        const double inv = __ddiv_rn(1.0, __dsqrt_rn(ss / (double) idx_dim + (double) eps));
+        float y = (float) (p * inv * (double) w_k_norm[d]);
+        if (d < n_rot) {
+            if (cos_tab != nullptr) y *= cos_tab[d % (n_rot / 2)];
+            else {   // on-the-fly: the spare rotates at position 0, so only the magnitude correction applies
+                float c0, s0;
+                rope_scaled_angle(0.0f, ka.freq_scale, ka.corr_low, ka.corr_high, ka.ext_factor, ka.attn_factor,
+                                  d % (n_rot / 2), c0, s0);
+                y *= c0;
+            }
+        }
+        dead[d] = y;
+        s_mean[d] = (double) y;
+        __syncthreads();
+        quantize(0);   // the spare slot
+        return;
+    }
+
+    if (slot != r - 1) return;
+    __syncthreads();
+
+    double m = 0.0;
+    for (int j = 0; j < r - 1; ++j) m = __dadd_rn(m, (double) tail[(size_t) j * idx_dim + d]);
+    m = __dadd_rn(m, (double) raw[d]);
+    m = m / (double) r;
+    s_mean[d] = m;
+    __syncthreads();
+
+    double ss = 0.0;
+    for (int i = 0; i < idx_dim; ++i) ss = __dadd_rn(ss, __dmul_rn(s_mean[i], s_mean[i]));
+    const double inv = __ddiv_rn(1.0, __dsqrt_rn(ss / (double) idx_dim + (double) eps));
+
+    const int b = pos / r;
+    if (d == 0) *block_pos = (int32_t) (pos_base + b * r);
+    s_mean[d] = (double) (m * inv * (double) w_k_norm[d]);
+    __syncthreads();
+    if (d < half) {
+        const int p = mrope_pos(mtab, pos_base + b * r, d);
+        float c, sn;
+        if (cos_tab != nullptr) {
+            const size_t toff = (size_t) p * half;
+            c = cos_tab[toff + d];
+            sn = sin_tab[toff + d];
+        } else {   // on-the-fly: the analytic angle (STRATA_ROPE_ONFLY), the native path's default math
+            const float theta_extrap = (float) p * powf(theta_scale, (float) d);
+            rope_scaled_angle(theta_extrap, ka.freq_scale, ka.corr_low, ka.corr_high, ka.ext_factor,
+                              ka.attn_factor, d, c, sn);
+        }
+        const float x0 = (float) s_mean[d], x1 = (float) s_mean[half + d];
+        s_mean[d] = (double) (x0 * c - x1 * sn);
+        s_mean[half + d] = (double) (x0 * sn + x1 * c);
+    }
+    __syncthreads();
+    quantize(b);          // the completed block
+    s_mean[d] = (double) dead[d];
+    __syncthreads();
+    quantize(b + 1);      // the spare moves to b+1
 }
 
 // ================= 3. qsa_index =================
@@ -247,6 +385,7 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
 /// One warp per indexer head, one block per pooled row; thread 0 sums the relu'd dots IN HEAD ORDER and maps
 /// the row's score onto its cells.  The reference's Relu is PER HEAD, so the dots cannot be summed first.
 __global__ void qsa_index_kernel(const float* __restrict__ pooled,
+                                 const int8_t* __restrict__ pooled_i8, const float* __restrict__ pooled_scale,
                                  const float* __restrict__ q_idx, const float* __restrict__ bias,
                                  int idx_n_head, int idx_dim, long long r,
                                  const int32_t* __restrict__ step, float* __restrict__ cell_scores) {
@@ -265,9 +404,16 @@ __global__ void qsa_index_kernel(const float* __restrict__ pooled,
     __syncthreads();
 
     double acc = 0.0;
-    for (int d = lane; d < idx_dim; d += 32)
-        acc = __dadd_rn(acc, __dmul_rn((double) pooled[(size_t) b * idx_dim + d],
-                                       (double) q_idx[(size_t) wid * idx_dim + d]));
+    if (pooled_i8 != nullptr) {
+        const float scale = pooled_scale[b];
+        for (int d = lane; d < idx_dim; d += 32)
+            acc = __dadd_rn(acc, __dmul_rn((double) ((float) pooled_i8[(size_t) b * idx_dim + d] * scale),
+                                           (double) q_idx[(size_t) wid * idx_dim + d]));
+    } else {
+        for (int d = lane; d < idx_dim; d += 32)
+            acc = __dadd_rn(acc, __dmul_rn((double) pooled[(size_t) b * idx_dim + d],
+                                           (double) q_idx[(size_t) wid * idx_dim + d]));
+    }
     for (int o = 16; o > 0; o >>= 1) acc = __dadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
     if (lane == 0) s_dot[wid] = acc;
     __syncthreads();
@@ -605,7 +751,8 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
     if (stream == nullptr) check_sync("kv_append");
 }
 
-void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
+void qsa_index_step(const float* pooled, const int8_t* pooled_i8, const float* pooled_scale,
+                    const float* q_idx, const float* bias, const QsaShapes& s,
                     const int32_t* step, int64_t max_blocks, float* cell_scores, void* stream) {
     validate(s, "qsa_index");
     if (step == nullptr) fail("qsa_index: step is null");
@@ -614,9 +761,15 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
     // `b > n_bid`, so the surplus blocks cost a launch and nothing else.
     const int threads = 32 * (int) s.idx_n_head;
     qsa_index_kernel<<<(unsigned) max_blocks, threads, 0, (cudaStream_t) stream>>>(
-        pooled, q_idx, bias, (int) s.idx_n_head, (int) s.idx_dim, s.idx_block, step, cell_scores);
+        pooled, pooled_i8, pooled_scale, q_idx, bias, (int) s.idx_n_head, (int) s.idx_dim, s.idx_block, step,
+        cell_scores);
     check_launch("qsa_index");
     if (stream == nullptr) check_sync("qsa_index");
+}
+
+void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
+                    const int32_t* step, int64_t max_blocks, float* cell_scores, void* stream) {
+    qsa_index_step(pooled, nullptr, nullptr, q_idx, bias, s, step, max_blocks, cell_scores, stream);
 }
 
 void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, const int32_t* step,
@@ -724,16 +877,28 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
                         const float* sin_tab, void* stream) {
     validate(s, "indexer_key_append");
     if (pos_dev == nullptr) fail("indexer_key_append: pos_dev is null");
-    if (b.tail == nullptr || b.dead == nullptr || b.pooled == nullptr || b.block_pos == nullptr)
+    if (b.tail == nullptr || b.dead == nullptr || b.block_pos == nullptr ||
+        (b.pooled == nullptr && b.pooled_i8 == nullptr))
         fail("indexer_key_append: the indexer buffers are not all set (tail/dead/pooled/block_pos)");
     const int threads = (int) s.idx_dim;
     const size_t smem = (size_t) s.idx_dim * sizeof(double);
+    const RopeScaling& sc = rope_scaling();
+    const float theta_scale = powf((float) sc.freq_base, -2.0f / (float) s.n_rot);
+    const RopeKernelArgs ka = sc.kernel_args((int) s.n_rot);
     // **ONE LAUNCH, NO HOST BRANCH ON THE POSITION.**  The completion rotation is inside the kernel now.  The
     // arguments here are identical for every token, which is the property a CUDA graph needs: this function can
     // be captured and replayed, and the position arrives through `pos_dev` like every other kernel's data.
-    indexer_key_append_kernel<<<1, threads, smem, (cudaStream_t) stream>>>(
-        raw, pos_dev, (int) pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled, b.block_pos, (int) s.idx_dim,
-        (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table());
+    // The int8/fp32 choice is per-session (constant), so it is graph-safe.
+    if (b.pooled_i8 != nullptr) {
+        indexer_key_append_i8_kernel<<<1, threads, smem, (cudaStream_t) stream>>>(
+            raw, pos_dev, (int) pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled_i8, b.pooled_scale,
+            b.block_pos, (int) s.idx_dim, (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table(),
+            theta_scale, ka);
+    } else {
+        indexer_key_append_kernel<<<1, threads, smem, (cudaStream_t) stream>>>(
+            raw, pos_dev, (int) pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled, b.block_pos, (int) s.idx_dim,
+            (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table(), theta_scale, ka);
+    }
     check_launch("indexer_key_append");
     if (stream == nullptr) check_sync("indexer_key_append");
 }
@@ -816,6 +981,60 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, 
                                                                               (int) s.head_dim, out);
     check_launch("qsa_gate_apply");
     if (stream == nullptr) check_sync("qsa_gate_apply");
+}
+
+
+// ================= pooled INT8 dequant / quant (conversation snapshot) =================
+//
+// The snapshot format stores the pooled indexer keys as FP32 (the layout predates the INT8 store).  With
+// STRATA_IDX_INT8 the authoritative keys are INT8 codes + a per-row scale, so a snapshot save dequantizes the
+// rows into a temporary FP32 buffer and a restore re-quantizes them.  The round trip is exact: the scale is
+// maxabs/127, so the maxabs element maps to +/-127 and re-quantizing the dequantized row reproduces the codes.
+
+__global__ void pooled_i8_dequant_kernel(const int8_t* __restrict__ i8, const float* __restrict__ scale,
+                                         float* __restrict__ out, long long total, int dim) {
+    const long long idx = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    out[idx] = (float) i8[idx] * scale[idx / dim];
+}
+
+__global__ void pooled_i8_quant_kernel(const float* __restrict__ in, int8_t* __restrict__ i8,
+                                       float* __restrict__ scale, int dim) {
+    const long long row = blockIdx.x;
+    extern __shared__ float s_red[];
+    float m = 0.0f;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) m = fmaxf(m, fabsf(in[row * dim + d]));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (lane == 0) s_red[wid] = m;
+    __syncthreads();
+    if (wid == 0) {
+        const int nw = (dim + 31) >> 5;
+        m = (lane < nw) ? s_red[lane] : 0.0f;
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        if (lane == 0) s_red[0] = m;
+    }
+    __syncthreads();
+    const float sc = s_red[0] > 0.0f ? s_red[0] / 127.0f : 1.0f;
+    if (threadIdx.x == 0) scale[row] = sc;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) i8[row * dim + d] = (int8_t) __float2int_rn(in[row * dim + d] / sc);
+}
+
+void pooled_i8_dequant(const int8_t* i8, const float* scale, float* out, int64_t rows, int dim, void* stream) {
+    if (rows <= 0) return;
+    const long long total = (long long) rows * dim;
+    pooled_i8_dequant_kernel<<<grid_for(total, 256), 256, 0, (cudaStream_t) stream>>>(i8, scale, out, total, dim);
+    check_launch("pooled_i8_dequant");
+    if (stream == nullptr) check_sync("pooled_i8_dequant");
+}
+
+void pooled_i8_quant(const float* in, int8_t* i8, float* scale, int64_t rows, int dim, void* stream) {
+    if (rows <= 0) return;
+    const int threads = 256;
+    const int smem = (threads / 32) * 4;   // one slot per warp (the second stage reads only the first (dim+31)>>5)
+    pooled_i8_quant_kernel<<<(unsigned) rows, threads, smem, (cudaStream_t) stream>>>(in, i8, scale, dim);
+    check_launch("pooled_i8_quant");
+    if (stream == nullptr) check_sync("pooled_i8_quant");
 }
 
 }  // namespace strata::kernels

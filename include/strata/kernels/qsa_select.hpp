@@ -28,12 +28,21 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream,
                       int64_t active_blocks = -1);   ///< perf-review C-1: > 0 launches only this many blocks (the
                                                      ///< batch's largest n_bid + 1; not for a captured graph)
+/// The same with INT8 pooled keys (STRATA_IDX_INT8): `pooled` is null and `pooled_i8` + per-row `pooled_scale` are read.
+void qsa_block_scores(const float* pooled, const int8_t* pooled_i8, const float* pooled_scale, const float* dead,
+                      const float* q_idx, const int32_t* steps, int64_t nq,
+                      int64_t max_blocks, const QsaShapes& s, float* scores, void* stream,
+                      int64_t active_blocks = -1);
 
 /// The same scores on tensor cores (3xTF32, FP32-level accuracy but another summation order: not bitwise; the tail
 /// block n_bid is the warp kernel's arithmetic). For the prompt path; false (nothing launched) on another geometry.
 /// On AMD it is the gfx12 (RDNA4) WMMA kernel (a three-way bf16 split, six products); false on any other AMD target.
 /// On CUDA below sm_80 (no TF32 tensor cores) it is an FP32 tiled kernel, also not bitwise, and only with STRATA_SELECT_SIMT=1 (otherwise false).
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                         int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
+/// The same with INT8 pooled keys: only the CUDA TF32 kernel reads them; the WMMA and FP32 tiled kernels return false.
+bool qsa_block_scores_tc(const float* pooled, const int8_t* pooled_i8, const float* pooled_scale, const float* dead,
+                         const float* q_idx, const int32_t* steps, int64_t nq,
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
 
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.

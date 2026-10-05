@@ -2738,7 +2738,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     // the indexer appends, token by token; then scores + selection for many queries at once:
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
-                    const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                    const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos, st.idx_pooled_i8, st.idx_pooled_scale};
                     pt.mark(kPfQsaIdx, cs);
                     // C-2: the chunk's appends in three launches instead of one per token (the same end state:
                     // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
@@ -2766,10 +2766,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // the scores on tensor cores (3xTF32: FP32-level, not bitwise), below sm_80 the FP32 tiled kernel with STRATA_SELECT_SIMT=1;
                         // STRATA_SELECT_OLD=1: the warp kernel
                         static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
-                        if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                        if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_pooled_i8, st.idx_pooled_scale, st.idx_dead, m.q_idx + t0 * 512,
                                                                              steps0, nb, m.max_blocks, s, m.sel_scores,
                                                                              m.cs, active))
-                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_pooled_i8, st.idx_pooled_scale, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs, active);
@@ -2798,7 +2798,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // design's last question). Every query is selected again from the pooled keys and `dead` rounded
                     // to fp16 (exactly what an fp16 store reads back); the agreement with the fp32 selection is
                     // printed cumulatively after each chunk's last QSA layer. Debug: syncs per layer.
-                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk) {
+                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk && !st.idx_int8) {
                         static float *pooled16 = nullptr, *dead16 = nullptr;
                         static int32_t* ids16 = nullptr;
                         static double shared = 0, cells = 0;

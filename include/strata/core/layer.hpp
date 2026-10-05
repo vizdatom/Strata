@@ -245,7 +245,10 @@ struct QsaState {
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
     float* idx_dead = nullptr;       ///< (idx_dim,): the spare slot's key, CONSTANT for the sequence
-    float* idx_pooled = nullptr;     ///< (max_cells/idx_block + 2, idx_dim)
+    float* idx_pooled = nullptr;     ///< (max_cells/idx_block + 2, idx_dim) - fp32 path
+    int8_t* idx_pooled_i8 = nullptr; ///< (max_cells/idx_block + 2, idx_dim) - int8 path (STRATA_IDX_INT8)
+    float* idx_pooled_scale = nullptr;///< (max_cells/idx_block + 2,) per-row scale of the int8 path
+    bool idx_int8 = false;           ///< the pooled keys are int8 (idx_pooled is null, idx_pooled_i8 set)
     int32_t* idx_block_pos = nullptr;
 
     float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64
@@ -282,6 +285,10 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
 /// resident state).
 void qsa_set_kv_resident(int64_t cells);
+void qsa_set_idx_int8(bool on);
+bool qsa_idx_int8();
+void qsa_set_rope_onfly(bool on);
+bool qsa_rope_onfly();
 /// THE ELASTIC K/V (--kv-grow; vmm.hpp).  A mode-0 state's K/V pools get addresses for every cell of the context but
 /// physical memory only for the first `init_cells`; `qsa_kv_elastic_grow` maps more as the context grows (from
 /// chunks the expert cache gives up) and `qsa_kv_elastic_shrink` hands them back.  The addresses never move, so the

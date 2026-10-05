@@ -19,7 +19,9 @@ namespace strata::core::conversation_detail {
 /// device, and while another thread captures a graph on one (a drafter or a stage worker), HIP refuses it with
 /// "operation would make the legacy stream depend on a capturing blocking stream".  The caller's contract is
 /// unchanged: the device was synchronized before the copy (the copy itself is complete on return).
-inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
+/// `private_stream` is that stream (this thread's, of the current device), for work that must be ordered with the
+/// copies (the INT8 pooled keys' dequantize/quantize, STRATA_IDX_INT8).
+inline cudaError_t private_stream(cudaStream_t& out) {
     int dev = 0;
     cudaError_t e = cudaGetDevice(&dev);
     if (e != cudaSuccess) return e;
@@ -30,7 +32,14 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
         e = cudaStreamCreateWithFlags(&streams[(size_t) dev], cudaStreamNonBlocking);
         if (e != cudaSuccess) { streams[(size_t) dev] = nullptr; return e; }
     }
-    cudaStream_t s = streams[(size_t) dev];
+    out = streams[(size_t) dev];
+    return cudaSuccess;
+}
+
+inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
+    cudaStream_t s = nullptr;
+    cudaError_t e = private_stream(s);
+    if (e != cudaSuccess) return e;
     e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
     if (e != cudaSuccess) return e;
     e = cudaStreamSynchronize(s);
