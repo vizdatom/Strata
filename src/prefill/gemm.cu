@@ -3,6 +3,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -24,7 +25,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <tuple>
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 #include "hipblaslt_tuning.hpp"
@@ -297,10 +300,146 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
 
 }  // namespace
 
+
+// ---- cublasLt path (STRATA_CUBLASLT, default on) -------------------------------------------------------------
+// The classic cublasCreate allocates a driver-internal workspace (~370 MiB on an RTX 3060) that is invisible to
+// the engine's VRAM accounting and cannot be released; cublasLtCreate does not. The prompt path therefore runs
+// its tensor-core GEMMs through cublasLtMatmul with the caller's explicit workspace. STRATA_CUBLASLT=0 restores
+// the classic cublasGemmEx path.
+struct LtCallKey {
+    int type;      // 0 = bf16, 1 = f16
+    int t, n, k, ldy;
+    uint32_t beta_bits;
+
+    bool operator<(const LtCallKey& other) const {
+        return std::tie(type, n, k, ldy, t, beta_bits) <
+               std::tie(other.type, other.n, other.k, other.ldy, other.t, other.beta_bits);
+    }
+};
+
+struct LtCachedAlgo {
+    bool supported = false;
+    cublasLtMatmulAlgo_t algo{};
+    size_t workspace_bytes = 0;
+};
+
+struct LtState {
+    cublasLtHandle_t handle = nullptr;
+    void* workspace = nullptr;
+    size_t workspace_bytes = 0;
+    std::map<LtCallKey, LtCachedAlgo> cache;
+    uint64_t lt_launches = 0;
+    uint64_t fallbacks = 0;
+
+    ~LtState() {
+        if (handle) cublasLtDestroy(handle);
+    }
+};
+
+struct LtDescriptors {
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t a = nullptr;
+    cublasLtMatrixLayout_t b = nullptr;
+    cublasLtMatrixLayout_t c = nullptr;
+
+    ~LtDescriptors() {
+        if (op) cublasLtMatmulDescDestroy(op);
+        if (a) cublasLtMatrixLayoutDestroy(a);
+        if (b) cublasLtMatrixLayoutDestroy(b);
+        if (c) cublasLtMatrixLayoutDestroy(c);
+    }
+
+    bool init(cudaDataType_t type, int t, int n, int k, int ldy) {
+        const cublasOperation_t trans_a = CUBLAS_OP_T;
+        const cublasOperation_t trans_b = CUBLAS_OP_N;
+        if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)) !=
+                CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)) !=
+                CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatrixLayoutCreate(&a, type, (uint64_t) k, (uint64_t) n, (int64_t) k) != CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatrixLayoutCreate(&b, type, (uint64_t) k, (uint64_t) t, (int64_t) k) != CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatrixLayoutCreate(&c, CUDA_R_32F, (uint64_t) n, (uint64_t) t, (int64_t) ldy) !=
+                CUBLAS_STATUS_SUCCESS) {
+            return false;
+        }
+        return true;
+    }
+};
+
+bool lt_enabled() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_CUBLASLT");
+        if (!e) return 1;
+        return std::string(e) == "0" ? 0 : 1;
+    }();
+    return v == 1;
+}
+
+LtCachedAlgo resolve_lt_algo(LtState& state, int type, int t, int n, int k, int ldy, float beta) {
+    uint32_t beta_bits = 0;
+    static_assert(sizeof(beta_bits) == sizeof(beta));
+    std::memcpy(&beta_bits, &beta, sizeof(beta_bits));
+    const LtCallKey key{type, t, n, k, ldy, beta_bits};
+    const auto cached = state.cache.find(key);
+    if (cached != state.cache.end()) return cached->second;
+
+    LtCachedAlgo resolved;
+    const cudaDataType_t input_type = type == 0 ? CUDA_R_16BF : CUDA_R_16F;
+    LtDescriptors desc;
+    if (!desc.init(input_type, t, n, k, ldy)) return state.cache.emplace(key, resolved).first->second;
+
+    cublasLtMatmulPreference_t pref = nullptr;
+    cublasLtMatmulHeuristicResult_t result{};
+    int return_count = 0;
+    if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                             &state.workspace_bytes, sizeof(state.workspace_bytes)) !=
+            CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulAlgoGetHeuristic(state.handle, desc.op, desc.a, desc.b, desc.c, desc.c, pref, 1, &result,
+                                       &return_count) != CUBLAS_STATUS_SUCCESS ||
+        return_count <= 0) {
+        if (pref) cublasLtMatmulPreferenceDestroy(pref);
+        return state.cache.emplace(key, resolved).first->second;
+    }
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+
+    resolved.supported = true;
+    resolved.algo = result.algo;
+    resolved.workspace_bytes = result.workspaceSize;
+    return state.cache.emplace(key, resolved).first->second;
+}
+
+bool try_lt(LtState* state, int type, const uint16_t* x, const uint16_t* w, float* y, int t, int n, int k, int ldy,
+            float beta, void* stream) {
+    if (!state) return false;
+    const LtCachedAlgo resolved = resolve_lt_algo(*state, type, t, n, k, ldy, beta);
+    if (!resolved.supported) {
+        ++state->fallbacks;
+        return false;
+    }
+    const cudaDataType_t input_type = type == 0 ? CUDA_R_16BF : CUDA_R_16F;
+    LtDescriptors desc;
+    if (!desc.init(input_type, t, n, k, ldy)) return false;
+    const float alpha = 1.0f;
+    const cublasStatus_t status = cublasLtMatmul(state->handle, desc.op, &alpha, w, desc.a, x, desc.b, &beta, y,
+                                                 desc.c, y, desc.c, &resolved.algo, state->workspace,
+                                                 state->workspace_bytes, (cudaStream_t) stream);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        ++state->lt_launches;
+        return true;
+    }
+    std::fprintf(stderr, "prefill gemm: cublasLt launch failed with status %d\n", (int) status);
+    ++state->fallbacks;
+    return false;
+}
+
+
 Gemm::~Gemm() {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     delete static_cast<HipLtState*>(hipblaslt_state_);
 #endif
+    delete static_cast<LtState*>(cublaslt_state_);
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
     if (tc_w_) cudaFree(tc_w_);
     if (tc_x_) cudaFree(tc_x_);
@@ -312,20 +451,41 @@ Gemm::~Gemm() {
 
 bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
                          std::string& err) {
-    cublasHandle_t h = nullptr;
-    if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
-        err = "prefill gemm: cublasCreate: cuBLAS status " + std::to_string((int) s);
-        return false;
-    }
-    handle_ = h;
     stream_ = stream;
     external_ = true;
-    note(cublasSetStream(h, (cudaStream_t) stream), "cublasSetStream");
     workspace_ = workspace;
-    note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
-    note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
+    if (lt_enabled()) {
+        auto* state = new LtState();
+        state->workspace = workspace;
+        state->workspace_bytes = ws_bytes;
+        if (cublasLtCreate(&state->handle) != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "prefill gemm: cublasLtCreate failed; falling back to classic cuBLAS\n");
+            delete state;
+            cublasHandle_t h = nullptr;
+            if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
+                err = "prefill gemm: cublasCreate: cuBLAS status " + std::to_string((int) s);
+                return false;
+            }
+            handle_ = h;
+            note(cublasSetStream(h, (cudaStream_t) stream), "cublasSetStream");
+            note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
+            note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
+        } else {
+            cublaslt_state_ = state;
+        }
+    } else {
+        cublasHandle_t h = nullptr;
+        if (const cublasStatus_t s = cublasCreate(&h); s != CUBLAS_STATUS_SUCCESS) {
+            err = "prefill gemm: cublasCreate: cuBLAS status " + std::to_string((int) s);
+            return false;
+        }
+        handle_ = h;
+        note(cublasSetStream(h, (cudaStream_t) stream), "cublasSetStream");
+        note(cublasSetWorkspace(h, workspace_, ws_bytes), "cublasSetWorkspace");
+        note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
+    }
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws_bytes).release();
 #endif
@@ -509,6 +669,12 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 #endif
 #endif
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
+#if !defined(__HIPCC__)
+    if (lt_enabled() && try_lt(static_cast<LtState*>(cublaslt_state_), 0, X, W, Y, (int) T, (int) N, (int) K,
+                               (int) ldy, beta, stream_)) {
+        return;
+    }
+#endif
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
@@ -525,6 +691,12 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16, X, W, Y, T, N, K, ldy,
                       beta, stream_)) {
         STRATA_ABSORB_HIPBLAS_STICKY("hipBLASLt f16");
+        return;
+    }
+#endif
+#if !defined(__HIPCC__)
+    if (lt_enabled() && try_lt(static_cast<LtState*>(cublaslt_state_), 1, X, W, Y, (int) T, (int) N, (int) K,
+                               (int) ldy, beta, stream_)) {
         return;
     }
 #endif

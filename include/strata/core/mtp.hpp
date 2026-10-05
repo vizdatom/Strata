@@ -145,6 +145,8 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    bool experts_mapped_ = false;   ///< the experts are mmap'd host RAM (zero-copy), not VRAM
+    size_t experts_mapped_bytes_ = 0;
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;

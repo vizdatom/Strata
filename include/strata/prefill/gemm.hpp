@@ -54,6 +54,7 @@ private:
     void* workspace_ = nullptr;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
+    void* cublaslt_state_ = nullptr;
     // below sm_80: FP16 (Pascal: fp32) copies of a BF16 product's weight and activation slice (Gemm::bf16)
     uint16_t* tc_w_ = nullptr;
     int64_t tc_w_elems_ = 0;

@@ -162,6 +162,11 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
     extern __shared__ double s_mean[];   // idx_dim doubles
     const int d = threadIdx.x;
     const int pos = (int) __ldg(pos_dev);
+    // The commit graph launches one of these per window slot; the slots the window did not use carry
+    // pos = -1 (commit fills them so the graph's launch count stays constant).  `pos % r` is -1 for
+    // them, and `(size_t)(-1) * idx_dim` wraps to a write idx_dim floats BEFORE tail - the KV-streaming
+    // control block in streaming mode.  Unused slots do nothing.
+    if (pos < 0) return;
     const int slot = pos % r;
 
     // The RAW tail: a cell that COMPLETES a block is not stored, because the pool below consumes it directly.
@@ -277,6 +282,9 @@ __global__ void indexer_key_append_i8_kernel(const float* __restrict__ raw, cons
     __shared__ float s_warpmax[32];
     const int d = threadIdx.x;
     const int pos = (int) __ldg(pos_dev);
+    // Unused window slot (pos = -1, see indexer_key_append_kernel): do nothing.  Without this the
+    // `(size_t)(-1) * idx_dim` wrap writes idx_dim floats before tail - the KV-streaming control block.
+    if (pos < 0) return;
     const int slot = pos % r;
     const int half = n_rot / 2;
 
