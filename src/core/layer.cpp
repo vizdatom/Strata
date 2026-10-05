@@ -784,6 +784,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.map.miss_block = c.take<int32_t>((uint64_t) p.slots);
         st.map.miss_slot = c.take<int32_t>((uint64_t) p.slots);
         st.map.ctl = c.take<int32_t>((uint64_t) strata::kernels::kKvCtlInts);
+        // Zero the control block at allocation: the reset kernel may run against a different session's
+        // state (the split's primary), so the counters must be valid even before the first reset.
+        if (cudaMemset(st.map.ctl, 0, strata::kernels::kKvCtlInts * 4) != cudaSuccess) return 0;
     }
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);

@@ -239,6 +239,8 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    bool experts_mapped_ = false;   ///< the experts are mmap'd host RAM (zero-copy), not VRAM
+    size_t experts_mapped_bytes_ = 0;
     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;

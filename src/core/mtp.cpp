@@ -30,6 +30,11 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -149,7 +154,16 @@ MtpDrafter::~MtpDrafter() {
     if (sh_fork_) cudaEventDestroy(sh_fork_);
     if (sh_join_) cudaEventDestroy(sh_join_);
     if (owns_weights_ && dense_) cudaFree(dense_);
-    if (owns_weights_ && experts_) cudaFree(experts_);
+    if (owns_weights_ && experts_) {
+        if (experts_mapped_) {
+#ifndef _WIN32
+            cudaHostUnregister(experts_);
+            ::munmap(experts_, experts_mapped_bytes_);
+#endif
+        } else {
+            cudaFree(experts_);
+        }
+    }
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
@@ -297,26 +311,55 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // ---- the 512 routed experts, one blob each
     if (shared == nullptr) {
         const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
-        // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
-        // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
-        FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
-        if (f == nullptr) { err = "mtp: cannot open experts.bin"; return false; }
-        struct Closer {
-            FILE* f;
-            ~Closer() { if (f != nullptr) std::fclose(f); }
-        } closer{f};
-        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
-#if !defined(_WIN32)
-        strata::platform::advise_willneed(fileno(f), 0, bytes);
-#endif
-        std::vector<uint8_t> chunk(64u << 20);
-        for (uint64_t off = 0; off < bytes;) {
-            const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
-            if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
-            off += n;
+        bool mapped = false;
+#if !defined(_WIN32) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)   // (HIP: the VRAM copy)
+        // STRATA_MTP_MMAP (default on): the experts stay mmap'd in host RAM and the GPU reads them over PCIe
+        // (zero-copy), keeping 675 MiB out of VRAM.  The drafter is a small fraction of total time, so the slower
+        // PCIe reads are acceptable; STRATA_MTP_MMAP=0 restores the VRAM copy.
+        static const bool mmap_on = [] { const char* e = std::getenv("STRATA_MTP_MMAP"); return e == nullptr || std::string(e) != "0"; }();
+        if (mmap_on) {
+            const int fd = ::open((rt_dir + "/experts.bin").c_str(), O_RDONLY);
+            if (fd >= 0) {
+                void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+                ::close(fd);
+                if (p != MAP_FAILED && cudaHostRegister(p, bytes, cudaHostRegisterDefault) == cudaSuccess) {
+                    experts_ = (uint8_t*) p;
+                    experts_mapped_ = true;
+                    experts_mapped_bytes_ = bytes;
+                    mapped = true;
+                    std::fprintf(stderr, "strata mtp: experts mmap'd in host RAM (zero-copy), %llu MiB kept out of VRAM\n",
+                                 (unsigned long long) (bytes >> 20));
+                } else {
+                    const cudaError_t cre = cudaGetLastError();
+                    if (p != MAP_FAILED) ::munmap(p, bytes);
+                    std::fprintf(stderr, "strata mtp: experts mmap path failed (mmap_ok=%d, cudaHostRegister=%s); falling back to VRAM\n",
+                                 (int) (p != MAP_FAILED), cudaGetErrorString(cre));
+                }
+            }
         }
-        vram_ += bytes;
+#endif
+        if (!mapped) {
+            // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
+            // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
+            FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
+            if (f == nullptr) { err = "mtp: cannot open experts.bin"; return false; }
+            struct Closer {
+                FILE* f;
+                ~Closer() { if (f != nullptr) std::fclose(f); }
+            } closer{f};
+            if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+#if !defined(_WIN32)
+            strata::platform::advise_willneed(fileno(f), 0, bytes);
+#endif
+            std::vector<uint8_t> chunk(64u << 20);
+            for (uint64_t off = 0; off < bytes;) {
+                const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
+                if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
+                cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
+                off += n;
+            }
+            vram_ += bytes;
+        }
     }
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
