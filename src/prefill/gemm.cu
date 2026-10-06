@@ -575,7 +575,18 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
     workspace_ = workspace;
-    cublasSetWorkspace((cublasHandle_t) handle_, workspace_, ws_bytes);
+    if (handle_) cublasSetWorkspace((cublasHandle_t) handle_, workspace_, ws_bytes);
+#if !defined(__HIPCC__)
+    // the cublasLt path keeps its own workspace pointer: a relayout moves the workspace into the borrowed slots, and
+    // a stale pointer here has cublasLt scribble its split-K scratch over whatever owns the old address (the cached
+    // experts) - the prompt path then reads NaN weights ("!!!!" after any prompt that needs a relayout)
+    if (cublaslt_state_) {
+        auto* state = static_cast<LtState*>(cublaslt_state_);
+        if (state->workspace_bytes != ws_bytes) state->cache.clear();   // the algos were chosen for the old size
+        state->workspace = workspace_;
+        state->workspace_bytes = ws_bytes;
+    }
+#endif
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (hipblaslt_state_) {
         auto* state = static_cast<HipLtState*>(hipblaslt_state_);
