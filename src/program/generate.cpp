@@ -6908,6 +6908,17 @@ int main(int argc, char** argv) {
                                  "reads stay serialized (--ple-io direct, the default, keeps no mapping)\n",
                          o.ple_io.c_str(), o.ple_gguf.c_str());
     }
+    // STRATA_PREFILL_DIRECT=1: the prompt path reads the experts the file cache does not hold with O_DIRECT; the
+    // decode keeps reading through the mapping (FileExpertSource::enable_prefill_direct)
+    if (srcp == &src) {
+        if (const char* v = std::getenv("STRATA_PREFILL_DIRECT"); v != nullptr && std::atoi(v) != 0) {
+            std::string why;
+            const bool on = src.enable_prefill_direct(why);
+            std::fprintf(stderr, "strata generate: prefill direct reads %s (%s)\n",
+                         on ? "on: the prompt path reads uncached experts with O_DIRECT, the decode stays on the file cache"
+                            : "off", why.c_str());
+        }
+    }
     // 0.1.42 (H11): the default CPU share is armed only when the host has the memory for it.  One line says why not;
     // an explicit STRATA_PREFILL_CPU_SHARE (other than 0) is armed anyway, with a warning when memory is short.
     auto share_default_ok = [&]() -> bool {
@@ -12509,6 +12520,19 @@ int main(int argc, char** argv) {
                     ic_prev = ic;
                     fb_prev = fb;
                 }
+            }
+            // STRATA_PREFILL_DIRECT: this request's prompt-path blobs, read past the file cache vs copied from it
+            if (srcp == &src && src.prefill_direct()) {
+                static decltype(src.prefill_direct_stats()) pd0;
+                const auto pd = src.prefill_direct_stats();
+                std::fprintf(stderr, "strata serve: prefill direct: %lld blobs read with O_DIRECT (%.1f MB, %.0f ms), "
+                                     "%lld copied from the file cache (%.1f MB, %.0f ms), %lld fallbacks this request "
+                                     "(ms summed over the stager's threads)\n",
+                             (long long) (pd.direct - pd0.direct), (double) (pd.direct_bytes - pd0.direct_bytes) / 1e6,
+                             (double) (pd.direct_us - pd0.direct_us) / 1e3, (long long) (pd.cached - pd0.cached),
+                             (double) (pd.cached_bytes - pd0.cached_bytes) / 1e6,
+                             (double) (pd.cached_us - pd0.cached_us) / 1e3, (long long) (pd.fallbacks - pd0.fallbacks));
+                pd0 = pd;
             }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)

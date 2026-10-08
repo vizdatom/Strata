@@ -413,7 +413,10 @@ struct Stager {
     int batch = 1;
     // `from` set: the blob is copied by the source itself (CS-T: a GGUF read in place assembles it from its three
     // role slices; a pointer to it would not live as long as the queue)
-    struct Job { const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = 0, e = 0; };
+    // `direct` (STRATA_PREFILL_DIRECT): `from->prefill_copy` - the source reads an uncached blob past the file cache
+    struct Job {
+        const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = 0, e = 0; bool direct = false;
+    };
     std::vector<uint8_t*> buf;
     std::vector<char> pinned;
     std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
@@ -511,6 +514,13 @@ struct Stager {
                 for (int i = j; i < j + k; ++i) {
                     const Job& jb = jobs[(size_t) i];
                     if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
+                    if (jb.direct) {   // STRATA_PREFILL_DIRECT: the source reads it past the file cache, one at a time
+                        if (!jb.from->prefill_copy(jb.l, jb.e, buf[i % kRing])) {
+                            std::fprintf(stderr, "prefill: the expert source could not copy expert %d of layer %d\n", jb.e, jb.l);
+                            std::abort();
+                        }
+                        continue;
+                    }
                     from = jb.from;
                     rl[nr] = jb.l; re[nr] = jb.e; rd[nr] = buf[i % kRing]; ++nr;
                 }
@@ -2413,6 +2423,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 m.pp->p_issued = m.pp->pk = 0;
             }
             double ps_acc = 0.0;
+            const bool pdirect = m.src->prefill_direct();   // STRATA_PREFILL_DIRECT
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
@@ -2423,7 +2434,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const uint8_t* b = nullptr;
                     if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
                         job = (int) js.size();
-                        js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
+                        js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e, pdirect});
                     } else {
                         b = m.src->blob_stable(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
@@ -2438,7 +2449,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         if (!m.src->pinned(l, e)) {
                             job = (int) js.size();
-                            js.push_back({b, (size_t) lay0.blob_bytes(l)});
+                            if (pdirect) js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e, true});
+                            else js.push_back({b, (size_t) lay0.blob_bytes(l)});
                         }
                     }
                     seq.push_back({(int32_t) l, e, b, job});
@@ -3756,20 +3768,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::vector<int> job_of(order.size(), -1);
                         if (!stream_all) {
                             std::vector<Stager::Job> js;
+                            const bool pdirect = m.src->prefill_direct();   // STRATA_PREFILL_DIRECT
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
-                                if (m.src->transient(l, e)) {   // CS-T: copied by the source
-                                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                                if (pdirect || m.src->transient(l, e)) {   // CS-T / direct: copied by the source
+                                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e, pdirect});
                                     continue;
                                 }
                                 const uint8_t* b = m.src->blob_stable(l, e);
                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
                                 js.push_back({b, (size_t) lay.blob_bytes(l)});
                             }
-                            if (m.warmer) {
+                            if (m.warmer && !pdirect) {   // direct: the warmed pages would be read through the cache
                                 std::vector<int64_t> cur;
                                 for (size_t j = 0; j < order.size(); ++j)
                                     if (job_of[j] >= 0) cur.push_back(order[j]);
