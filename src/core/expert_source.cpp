@@ -1033,6 +1033,8 @@ void FileExpertSource::close() {
     paths_.clear();
     for (void* h : direct_) close_direct(h);
     direct_.clear();
+    for (void* h : pdirect_) close_direct(h);
+    pdirect_.clear();
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         // the buffers' last copies end before they are freed (#1237)
@@ -1851,7 +1853,9 @@ bool FileExpertSource::map_view(std::string& why) {
 #endif
 }
 
-bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+bool FileExpertSource::read_direct(const Fill* fills, size_t n) const { return read_direct_on(direct_, fills, n); }
+
+bool FileExpertSource::read_direct_on(const std::vector<void*>& fds, const Fill* fills, size_t n) const {
 #if defined(_WIN32)
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
@@ -1921,7 +1925,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(HANDLE) direct_[(size_t) x.file], x.a0, x.size, total});
+        sc.req.push_back({(HANDLE) fds[(size_t) x.file], x.a0, x.size, total});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -2041,7 +2045,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(int) (intptr_t) direct_[(size_t) x.file], x.a0, x.size, total});
+        sc.req.push_back({(int) (intptr_t) fds[(size_t) x.file], x.a0, x.size, total});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -2123,6 +2127,103 @@ bool bin_warm_on() {
     return on;
 }
 }  // namespace
+
+// STRATA_PREFILL_DIRECT: a prompt chunk stages nearly every expert of every layer, in the same order each chunk.
+// Through the mapping, on a PC whose RAM cannot keep all of them, that is a stream of misses the file cache serves
+// one small synchronous page fault at a time (read-ahead 128 KiB), and every page it brings in evicts one the decode
+// would have hit.  So the prompt path asks the file cache what it holds (mincore: a page table walk, microseconds for
+// a 1.4 MB blob - far below the read it decides about) and reads the rest past it with O_DIRECT, on descriptors of
+// its own: read_direct's 4 KiB-aligned windows (a blob's offset need not be aligned; the window around it is read
+// into the thread's aligned buffer and its bytes copied into place), one io_submit per blob, each stager thread
+// with its own context - the threads' blobs are the queue depth.  The decode's reads are unchanged.
+bool FileExpertSource::enable_prefill_direct(std::string& why) {
+#if defined(__linux__)
+    if (base_ == nullptr || paths_.empty()) {
+        why = "no expert files open";
+        return false;
+    }
+    if (!direct_.empty()) {
+        why = "the file tier already reads unbuffered";
+        return false;
+    }
+    if (!pdirect_.empty()) {
+        why = "already on";
+        return true;
+    }
+    if (const char* v = std::getenv("STRATA_PREFILL_DIRECT_MIN"); v != nullptr && v[0] != '\0')
+        pdirect_min_ = std::clamp(std::atof(v), 0.0, 2.0);
+    for (const std::string& path : paths_) {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (fd < 0) {
+            why = "cannot open " + path + " with O_DIRECT (" + std::strerror(errno) + "), the prompt reads through the "
+                  "file cache";
+            for (void* d : pdirect_) close_direct(d);
+            pdirect_.clear();
+            return false;
+        }
+        pdirect_.push_back((void*) (intptr_t) fd);
+    }
+    char b[200];
+    std::snprintf(b, sizeof b, "%zu file%s%s; a blob with at least %.0f%% of its pages in the file cache is copied "
+                  "from the mapping", pdirect_.size(), pdirect_.size() == 1 ? "" : "s",
+                  role_ptr_.empty() ? " (experts.bin)" : " (the GGUF in place)", 100.0 * pdirect_min_);
+    why = b;
+    return true;
+#else
+    why = "O_DIRECT prompt reads are Linux-only";
+    return false;
+#endif
+}
+
+bool FileExpertSource::prefill_copy(int64_t layer, int64_t expert, uint8_t* dst) {
+    if (pdirect_.empty()) return copy_blob(layer, expert, dst);
+    if (base_ == nullptr || dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+        return false;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
+    if (complement_ready_) {   // the RAM copy holds it: as copy_blob
+        const uint8_t* held = resident_blob(index);
+        if (held == nullptr && !override_.empty()) held = override_[index];
+        if (held != nullptr) {
+            std::memcpy(dst, held, (size_t) bytes);
+            return true;
+        }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    // the share of the blob's pages in the file cache (mincore over its range, or its three role slices); 1 when it
+    // cannot tell (the blob is then copied from the mapping)
+    uint64_t total = 0;
+    const uint64_t res = cached_bytes(layer, expert, total);
+    bool direct = (total > 0 ? (double) res / (double) total : 1.0) < pdirect_min_;
+    if (direct) {
+        const Fill f{0, layer, expert, dst};
+        if (!read_direct_on(pdirect_, &f, 1)) {   // a failed read: the mapping below
+            pd_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+            direct = false;
+        }
+    }
+    if (!direct && !copy_from_files(layer, expert, dst)) return false;   // direct_ is empty: the mapping
+    const uint64_t us =
+        (uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    (direct ? pd_direct_ : pd_cached_).fetch_add(1, std::memory_order_relaxed);
+    (direct ? pd_direct_bytes_ : pd_cached_bytes_).fetch_add(bytes, std::memory_order_relaxed);
+    (direct ? pd_direct_us_ : pd_cached_us_).fetch_add(us, std::memory_order_relaxed);
+    file_us_.fetch_add(us, std::memory_order_relaxed);
+    file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+}
+
+FileExpertSource::PrefillDirectStats FileExpertSource::prefill_direct_stats() const {
+    PrefillDirectStats s;
+    s.direct = pd_direct_.load(std::memory_order_relaxed);
+    s.cached = pd_cached_.load(std::memory_order_relaxed);
+    s.fallbacks = pd_fallbacks_.load(std::memory_order_relaxed);
+    s.direct_bytes = pd_direct_bytes_.load(std::memory_order_relaxed);
+    s.cached_bytes = pd_cached_bytes_.load(std::memory_order_relaxed);
+    s.direct_us = pd_direct_us_.load(std::memory_order_relaxed);
+    s.cached_us = pd_cached_us_.load(std::memory_order_relaxed);
+    return s;
+}
 
 bool FileExpertSource::warms() const {
     if (!direct_.empty()) return false;

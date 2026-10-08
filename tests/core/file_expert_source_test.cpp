@@ -531,6 +531,71 @@ void test_unbuffered_reads() {
     source.close();
 }
 
+// STRATA_PREFILL_DIRECT: prefill_copy hands out the file's bytes both ways - read past the file cache with O_DIRECT
+// (STRATA_PREFILL_DIRECT_MIN above 1: every blob counts as uncached; the blobs' offsets are not 4 KiB-aligned) and
+// copied from the mapping (0: every blob counts as cached) - with no fallback, and the source stays mapped for the
+// decode (not unbuffered).  In the working directory: a tmpfs /tmp has no O_DIRECT (the test then says so and skips).
+void test_prefill_direct() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr int64_t layers = 2;
+    constexpr int64_t experts = 3;
+    const uint64_t total = (uint64_t) layers * (uint64_t) experts * BLOB;
+    TempDirectory dir(fs::current_path());
+    std::string err;
+    require(expert_layout_load(dir.path.string(), layers, experts, err), "could not load canonical layout: " + err);
+    std::vector<uint8_t> bytes((size_t) total);
+    uint64_t x = 0x243F6A8885A308D3ull;
+    for (uint8_t& b : bytes) {
+        x = x * 6364136223846793005ull + 1442695040888963407ull;
+        b = (uint8_t) (x >> 56);
+    }
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary | std::ios::trunc);
+        out.write((const char*) bytes.data(), (std::streamsize) bytes.size());
+        require((bool) out, "could not write the synthetic experts.bin");
+    }
+    for (const char* min : {"2", "0"}) {
+        set_env("STRATA_PREFILL_DIRECT_MIN", min);
+        FileExpertSource source;
+        require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
+        std::string why;
+        const bool on = source.enable_prefill_direct(why);
+        set_env("STRATA_PREFILL_DIRECT_MIN", nullptr);
+#if defined(__linux__)
+        if (!on) {
+            std::cout << "file_expert_source_test: prefill direct reads skipped (" << why << ")\n";
+            source.close();
+            return;
+        }
+#else
+        require(!on, "prefill direct reads on a platform without them");
+        source.close();
+        return;
+#endif
+        require(source.prefill_direct() && !source.unbuffered(), "prefill direct must leave the decode's tier mapped");
+        std::vector<uint8_t> copy((size_t) BLOB);
+        for (int64_t l = 0; l < layers; ++l)
+            for (int64_t e = 0; e < experts; ++e) {
+                std::fill(copy.begin(), copy.end(), (uint8_t) 0);
+                require(source.prefill_copy(l, e, copy.data()) &&
+                            std::memcmp(copy.data(), bytes.data() + (size_t) ((l * experts + e) * (int64_t) BLOB),
+                                        (size_t) BLOB) == 0,
+                        std::string("a prefill_copy differs from the file (STRATA_PREFILL_DIRECT_MIN=") + min + ")");
+            }
+        const auto s = source.prefill_direct_stats();
+        const bool all_direct = min[0] == '2';
+        require(s.fallbacks == 0, "a prefill direct read fell back to the mapping");
+        require(s.direct == (all_direct ? layers * experts : 0) && s.cached == (all_direct ? 0 : layers * experts),
+                "prefill direct counted " + std::to_string(s.direct) + " direct / " + std::to_string(s.cached) +
+                    " cached blobs (STRATA_PREFILL_DIRECT_MIN=" + min + ")");
+        const uint8_t* b = source.blob(1, 2);
+        require(b != nullptr && std::memcmp(b, bytes.data() + (size_t) (5 * BLOB), (size_t) BLOB) == 0,
+                "the decode's mapped blob differs with prefill direct on");
+        source.close();
+    }
+}
+
 // STRATA_BIN_WARM=1: a pack's mapped experts.bin warms too (madvise(WILLNEED) on each blob's contiguous range),
 // counts what it warmed and skips nothing it should not; the bytes the mapping hands out are unchanged.  Runs first:
 // the switch is read once per process.
@@ -790,6 +855,7 @@ int main(int argc, char** argv) {
         test_host_memory();
         test_canonical_layout();
         test_unbuffered_reads();
+        test_prefill_direct();
         test_io_prefetch();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();

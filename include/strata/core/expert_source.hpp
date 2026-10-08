@@ -222,6 +222,11 @@ public:
     /// blob of (layers[i], experts[i]).  A source that reads a drive may merge neighbouring blobs into one request.
     /// Default: copy_blob one by one.
     virtual bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n);
+    /// STRATA_PREFILL_DIRECT: whether the prompt path's stager copies every blob it stages with `prefill_copy` (a file
+    /// source that reads the blobs the file cache does not hold around it).  Default: no.
+    virtual bool prefill_direct() const { return false; }
+    /// The prompt path's copy of a blob into `dst` when `prefill_direct`.  Default: copy_blob.
+    virtual bool prefill_copy(int64_t layer, int64_t expert, uint8_t* dst) { return copy_blob(layer, expert, dst); }
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
@@ -710,6 +715,23 @@ public:
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }
     /// #286: blobs an unbuffered read could not deliver, read through the mapping instead (0 when all went direct).
     int64_t direct_fallbacks() const { return direct_fallbacks_.load(std::memory_order_relaxed); }
+    /// STRATA_PREFILL_DIRECT=1: the prompt path reads the blobs the file cache does not hold (mincore) with O_DIRECT, on
+    /// descriptors of its own (read_direct), and copies the cached ones from the mapping as before.  The decode keeps
+    /// reading through the mapping (unlike set_unbuffered), so a prompt's stream of nearly every expert neither evicts
+    /// the decode's working set from the file cache nor waits on one small page fault at a time.  Linux only; false
+    /// (and nothing changes) when the tier is already unbuffered or the files refuse O_DIRECT.
+    /// STRATA_PREFILL_DIRECT_MIN (default 0.5): a blob with at least this share of its pages cached is copied from
+    /// the mapping.
+    bool enable_prefill_direct(std::string& why);
+    bool prefill_direct() const override { return !pdirect_.empty(); }
+    bool prefill_copy(int64_t layer, int64_t expert, uint8_t* dst) override;
+    struct PrefillDirectStats {
+        int64_t direct = 0, cached = 0, fallbacks = 0;
+        uint64_t direct_bytes = 0, cached_bytes = 0, direct_us = 0, cached_us = 0;
+    };
+    /// Since the start: the blobs `prefill_copy` read with O_DIRECT / copied from the mapping (time summed over the
+    /// stager's threads), and the O_DIRECT reads that failed and were copied from the mapping instead.
+    PrefillDirectStats prefill_direct_stats() const;
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
     /// interesting once Phase 3 makes it not so.
@@ -758,6 +780,12 @@ private:
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;
+    /// read_direct on these descriptors (the tier's direct_, or the prompt path's pdirect_).
+    bool read_direct_on(const std::vector<void*>& fds, const Fill* fills, size_t n) const;
+    std::vector<void*> pdirect_;              ///< STRATA_PREFILL_DIRECT: the prompt path's O_DIRECT descriptors
+    double pdirect_min_ = 0.5;                ///< a blob at least this share cached is copied from the mapping
+    std::atomic<int64_t> pd_direct_{0}, pd_cached_{0}, pd_fallbacks_{0};
+    std::atomic<uint64_t> pd_direct_bytes_{0}, pd_cached_bytes_{0}, pd_direct_us_{0}, pd_cached_us_{0};
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);
