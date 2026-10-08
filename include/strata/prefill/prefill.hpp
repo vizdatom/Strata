@@ -165,7 +165,17 @@ public:
     /// run `init`.
     bool set_stage_helper(Prefill* helper, std::string& err);
 
+    /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
+    /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.
+    bool layer_major_mid() const { return lm_mid_; }
+
 private:
+    // Layer-major prefill: the super-chunk's buffers for an n-token prompt (its size, 0 = not this prompt: `why`),
+    // the run, and the buffers given back after it.
+    int64_t lm_prepare(int64_t n, std::string& why);
+    bool run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    void lm_release();
+    bool lm_mid_ = false;
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);

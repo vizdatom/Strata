@@ -5605,7 +5605,9 @@ int main(int argc, char** argv) {
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
-            if (o.prompt_cache_every > 0 && done >= pp_next_check) {
+            // layer-major prefill: a sub-chunk before its super-chunk's end has the super-chunk's state - the
+            // checkpoint is taken at that end instead
+            if (o.prompt_cache_every > 0 && done >= pp_next_check && !sp.layer_major_mid()) {
                 bool saved = false;
                 if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk
                     std::vector<ConvCheckpoint> parts;
