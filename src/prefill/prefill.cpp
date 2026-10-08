@@ -4093,6 +4093,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine_peer(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum, m.pp->back_at, m.bo, T, m.cs);
                     else
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    if (const char* dm = std::getenv("STRATA_DUMP_MOE"); dm && c0 == 0 &&
+                        l == (std::getenv("STRATA_DUMP_MOE_LAYER") ? std::atoll(std::getenv("STRATA_DUMP_MOE_LAYER")) : 0)) {
+                        // debug: one layer's MoE output rows of the first chunk (the layer-major A/B)
+                        cudaStreamSynchronize(m.cs);
+                        std::vector<float> h((size_t) (T * N));
+                        cudaMemcpy(h.data(), m.bo, h.size() * 4, cudaMemcpyDeviceToHost);
+                        if (std::FILE* f = std::fopen(dm, "wb")) { std::fwrite(h.data(), 4, h.size(), f); std::fclose(f); }
+                    }
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
@@ -4223,6 +4231,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
                     cudaMemcpy(row.data(), m.R + t * D, (size_t) D * 4, cudaMemcpyDeviceToHost);
                     const int64_t pos = p0 + t;
+                    std::fwrite(&pos, sizeof pos, 1, f);
+                    std::fwrite(row.data(), 4, row.size(), f);
+                }
+                if (c0 + T == n && (p0 + T - 1) % 64 != 0) {   // the prompt's last row (the first answer token's input)
+                    cudaMemcpy(row.data(), m.R + (T - 1) * D, (size_t) D * 4, cudaMemcpyDeviceToHost);
+                    const int64_t pos = p0 + T - 1;
                     std::fwrite(&pos, sizeof pos, 1, f);
                     std::fwrite(row.data(), 4, row.size(), f);
                 }
@@ -4988,6 +5002,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                 std::fwrite(&pos, sizeof pos, 1, f);
                                 std::fwrite(row.data(), 4, row.size(), f);
                             }
+                            if (c0 + T == n && (p0 + T - 1) % 64 != 0) {   // the prompt's last row
+                                cudaMemcpy(row.data(), m.R + (T - 1) * D, (size_t) D * 4, cudaMemcpyDeviceToHost);
+                                const int64_t pos = p0 + T - 1;
+                                std::fwrite(&pos, sizeof pos, 1, f);
+                                std::fwrite(row.data(), 4, row.size(), f);
+                            }
                             std::fclose(f);
                         }
                     }
@@ -5277,6 +5297,13 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             ms_attn += ms_since(ta);
             if (l == L) break;
             if (!lm_experts(l, Sn)) return false;
+            if (const char* dm = std::getenv("STRATA_DUMP_MOE"); dm && sc0 == 0 &&
+                l == (std::getenv("STRATA_DUMP_MOE_LAYER") ? std::atoll(std::getenv("STRATA_DUMP_MOE_LAYER")) : 0)) {
+                cudaStreamSynchronize(cs);   // debug: the first chunk's rows of this layer's MoE output
+                std::vector<float> h((size_t) (std::min(m.T, Sn) * N));
+                cudaMemcpy(h.data(), lb.acc, h.size() * 4, cudaMemcpyDeviceToHost);
+                if (std::FILE* f = std::fopen(dm, "wb")) { std::fwrite(h.data(), 4, h.size(), f); std::fclose(f); }
+            }
         }
     }
     lm_mid_ = false;
