@@ -2113,8 +2113,26 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 #endif
 }
 
+namespace {
+/// STRATA_BIN_WARM=1: warm() also covers a pack's mapped experts.bin (off by default: the A/B arm).
+bool bin_warm_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_BIN_WARM");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+}  // namespace
+
+bool FileExpertSource::warms() const {
+    if (!direct_.empty()) return false;
+    return !role_ptr_.empty() || io_pf_ || (base_ != nullptr && !unmapped_ && bin_warm_on());
+}
+
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
-    if ((role_ptr_.empty() && !io_pf_) || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    const bool bin = role_ptr_.empty() && !io_pf_;   // a pack's experts.bin: one contiguous blob per expert
+    if (bin && (base_ == nullptr || unmapped_ || !direct_.empty() || !bin_warm_on())) return;
+    if (n <= 0 || layer < 0 || layer >= n_layers_) return;
     uint32_t stamp;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -2135,6 +2153,18 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
         warm_count_.fetch_add(1, std::memory_order_relaxed);
         if (io_pf_ && direct_.empty()) {   // read it ahead with pread on the I/O threads (instead of an madvise hint)
             if (io_ahead_) io_enqueue(layer, e);
+            continue;
+        }
+        if (bin) {
+            const uint64_t per = layer_blob_bytes_[(size_t) layer];
+            const uint8_t* p = mapped_blob(layer, e);
+            if (p == nullptr) continue;
+#if defined(_WIN32)
+            ranges.push_back({(PVOID) p, (SIZE_T) per});
+#else
+            const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
+            (void) madvise((void*) a, (size_t) ((uintptr_t) p + per - a), MADV_WILLNEED);
+#endif
             continue;
         }
         if (role_ptr_.empty() || unmapped_) continue;
