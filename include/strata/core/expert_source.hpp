@@ -528,10 +528,11 @@ public:
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
     /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
-    /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
+    /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.  A pack's experts.bin does the same when
+    /// STRATA_BIN_WARM=1 (each blob is one contiguous range of the mapping).
     void warm(int64_t layer, const int64_t* experts, int64_t n) override;
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
-    bool warms() const override { return !role_ptr_.empty() && direct_.empty(); }
+    bool warms() const override;
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
     int64_t warmed_hits() const { return warm_hits_.load(std::memory_order_relaxed); }
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }

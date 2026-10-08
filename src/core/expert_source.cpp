@@ -1333,8 +1333,26 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 #endif
 }
 
+namespace {
+/// STRATA_BIN_WARM=1: warm() also covers a pack's mapped experts.bin (off by default: the A/B arm).
+bool bin_warm_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_BIN_WARM");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+}  // namespace
+
+bool FileExpertSource::warms() const {
+    if (!direct_.empty()) return false;
+    return !role_ptr_.empty() || (base_ != nullptr && bin_warm_on());
+}
+
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
-    if (role_ptr_.empty() || n <= 0 || layer < 0 || layer >= n_layers_) return;
+    const bool bin = role_ptr_.empty();   // a pack's experts.bin: one contiguous blob per expert
+    if (bin && (base_ == nullptr || !direct_.empty() || !bin_warm_on())) return;
+    if (n <= 0 || layer < 0 || layer >= n_layers_) return;
     uint32_t stamp;
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -1353,6 +1371,17 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
             continue;                                                    // in the RAM copy
         if (warm_stamp_) warm_stamp_[index].store(stamp, std::memory_order_relaxed);
         warm_count_.fetch_add(1, std::memory_order_relaxed);
+        if (bin) {
+            const uint64_t per = layer_blob_bytes_[(size_t) layer];
+            const uint8_t* p = base_ + (size_t) (layer_offsets_[(size_t) layer] + (uint64_t) e * per);
+#if defined(_WIN32)
+            ranges.push_back({(PVOID) p, (SIZE_T) per});
+#else
+            const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
+            (void) madvise((void*) a, (size_t) ((uintptr_t) p + per - a), MADV_WILLNEED);
+#endif
+            continue;
+        }
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * layer + r);
             const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) e * role_bytes_[i]);

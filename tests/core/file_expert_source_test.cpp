@@ -360,6 +360,44 @@ void test_unbuffered_reads() {
     source.close();
 }
 
+// STRATA_BIN_WARM=1: a pack's mapped experts.bin warms too (madvise(WILLNEED) on each blob's contiguous range),
+// counts what it warmed and skips nothing it should not; the bytes the mapping hands out are unchanged.  Runs first:
+// the switch is read once per process.
+void test_bin_warm() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr int64_t layers = 2;
+    constexpr int64_t experts = 3;
+    const uint64_t total = (uint64_t) layers * (uint64_t) experts * BLOB;
+    TempDirectory dir(fs::current_path());
+    std::string err;
+    require(expert_layout_load(dir.path.string(), layers, experts, err), "could not load canonical layout: " + err);
+    std::vector<uint8_t> bytes((size_t) total);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (uint8_t) (i * 131u + 7u);
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary | std::ios::trunc);
+        out.write((const char*) bytes.data(), (std::streamsize) bytes.size());
+        require((bool) out, "could not write the synthetic experts.bin");
+    }
+    set_env("STRATA_BIN_WARM", "1");
+    FileExpertSource source;
+    require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
+    require(source.warms(), "STRATA_BIN_WARM=1 but a mapped experts.bin does not warm");
+    const int64_t first[] = {0, 2}, second[] = {1, -1, 3};   // -1 and 3: out of range, skipped
+    source.warm(0, first, 2);
+    source.warm(1, second, 3);
+    source.warm(2, first, 2);   // no such layer
+    require(source.warmed() == 3, "warmed " + std::to_string(source.warmed()) + " blobs, expected 3");
+    for (int64_t l = 0; l < layers; ++l)
+        for (int64_t e = 0; e < experts; ++e) {
+            const uint8_t* b = source.blob(l, e);
+            require(b != nullptr && std::memcmp(b, bytes.data() + (size_t) ((l * experts + e) * (int64_t) BLOB), BLOB) == 0,
+                    "a warmed experts.bin hands out other bytes");
+        }
+    source.close();
+    set_env("STRATA_BIN_WARM", nullptr);
+}
+
 // #633: the host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
 // (a limit, unlimited), and no cgroup line at all.  Elsewhere than Linux it reads the machine's RAM.
 void test_host_memory() {
@@ -414,6 +452,7 @@ void test_host_memory() {
 
 int main() {
     try {
+        test_bin_warm();
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();
